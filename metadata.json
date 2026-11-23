@@ -1,0 +1,6 @@
+{
+  "name": "CastForge Studio",
+  "description": "Production-ready Android mobile live streaming studio with multi-RTMP broadcasting, interactive scene compositing, real-time audio mixing, and native Capacitor streaming engine.",
+  "requestFramePermissions": ["camera", "microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

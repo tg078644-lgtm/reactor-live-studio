@@ -1,0 +1,150 @@
+import java.util.Base64
+
+apply plugin: 'com.android.application'
+apply plugin: 'org.jetbrains.kotlin.android'
+
+def keystoreDir = file("${rootProject.projectDir}/keystore")
+def autoKeystoreFile = file("${keystoreDir}/castforge-auto.keystore")
+def resolvedKeystorePath = System.getenv("KEYSTORE_FILE") ?: autoKeystoreFile.absolutePath
+def resolvedKeystoreFile = file(resolvedKeystorePath)
+def resolvedStorePassword = System.getenv("KEYSTORE_PASSWORD") ?: "castforge2026"
+def resolvedKeyAlias = System.getenv("KEY_ALIAS") ?: "castforge"
+def resolvedKeyPassword = System.getenv("KEY_PASSWORD") ?: "castforge2026"
+
+/**
+ * Automated APK Signing Keystore Provisioning Task.
+ *
+ * 1. If KEYSTORE_BASE64 is supplied in CI/CD secrets, decodes it into the target keystore file.
+ * 2. If a keystore file already exists on disk (local or decoded), reuses it untouched.
+ * 3. Otherwise, automatically generates a valid RSA-2048 PKCS12 keystore using keytool
+ *    so both local builds and GitHub Actions cloud builds always emit signed, ready-to-install APKs
+ *    without failing on missing keystore secrets.
+ */
+tasks.register("ensureSigningKeystore") {
+    group = "signing"
+    description = "Ensures a valid Android signing keystore exists, decoding CI secrets or auto-generating a default keystore."
+
+    doLast {
+        if (!resolvedKeystoreFile.parentFile.exists()) {
+            resolvedKeystoreFile.parentFile.mkdirs()
+        }
+
+        def base64Secret = System.getenv("KEYSTORE_BASE64")
+        if (base64Secret != null && !base64Secret.trim().isEmpty()) {
+            logger.lifecycle("[CastForge Signing] Decoding keystore from KEYSTORE_BASE64 secret -> ${resolvedKeystoreFile}")
+            byte[] decoded = Base64.getDecoder().decode(base64Secret.replaceAll("\\s+", ""))
+            resolvedKeystoreFile.bytes = decoded
+            return
+        }
+
+        if (resolvedKeystoreFile.exists()) {
+            logger.lifecycle("[CastForge Signing] Using existing keystore -> ${resolvedKeystoreFile}")
+            return
+        }
+
+        logger.lifecycle("[CastForge Signing] No keystore found in secrets; generating default signing keystore at ${resolvedKeystoreFile}")
+        def javaHome = System.getProperty("java.home")
+        def keytoolName = org.gradle.internal.os.OperatingSystem.current().isWindows() ? "keytool.exe" : "keytool"
+        def keytoolBin = file("${javaHome}/bin/${keytoolName}").exists()
+            ? file("${javaHome}/bin/${keytoolName}").absolutePath
+            : keytoolName
+
+        exec {
+            commandLine(
+                keytoolBin,
+                "-genkeypair",
+                "-v",
+                "-storetype", "PKCS12",
+                "-keystore", resolvedKeystoreFile.absolutePath,
+                "-storepass", resolvedStorePassword,
+                "-alias", resolvedKeyAlias,
+                "-keypass", resolvedKeyPassword,
+                "-keyalg", "RSA",
+                "-keysize", "2048",
+                "-validity", "10000",
+                "-dname", "CN=CastForge Studio, OU=Broadcast Engineering, O=CastForge, L=San Francisco, S=CA, C=US"
+            )
+        }
+        logger.lifecycle("[CastForge Signing] Successfully generated default signing keystore.")
+    }
+}
+
+// Automatically guarantee keystore exists before any APK/AAB packaging or signing task runs
+tasks.matching {
+    it.name.startsWith("assemble") ||
+    it.name.startsWith("bundle") ||
+    it.name.startsWith("package") ||
+    it.name.startsWith("validateSigning")
+}.configureEach {
+    dependsOn(tasks.named("ensureSigningKeystore"))
+}
+
+android {
+    namespace "com.castforge.studio"
+    compileSdk rootProject.ext.compileSdkVersion
+
+    defaultConfig {
+        applicationId "com.castforge.studio"
+        minSdkVersion rootProject.ext.minSdkVersion
+        targetSdkVersion rootProject.ext.targetSdkVersion
+        versionCode 100
+        versionName "1.0.0"
+        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    kotlinOptions {
+        jvmTarget = "17"
+    }
+
+    signingConfigs {
+        autoSigned {
+            storeFile resolvedKeystoreFile
+            storePassword resolvedStorePassword
+            keyAlias resolvedKeyAlias
+            keyPassword resolvedKeyPassword
+            enableV1Signing true
+            enableV2Signing true
+            enableV3Signing true
+        }
+    }
+
+    buildTypes {
+        debug {
+            signingConfig signingConfigs.autoSigned
+            minifyEnabled false
+        }
+        release {
+            signingConfig signingConfigs.autoSigned
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+}
+
+dependencies {
+    implementation fileTree(include: ['*.jar'], dir: 'libs')
+    implementation "androidx.appcompat:appcompat:$androidxAppCompatVersion"
+    implementation "androidx.core:core-ktx:1.15.0"
+    implementation "androidx.activity:activity-ktx:1.9.3"
+    implementation project(':capacitor-android')
+
+    // EncryptedSharedPreferences for RTMP URLs & Stream Keys
+    implementation "androidx.security:security-crypto:1.1.0-alpha06"
+
+    // CameraX / Camera2 PiP & IRL Vlogging pipeline
+    def cameraxVersion = "1.4.1"
+    implementation "androidx.camera:camera-core:${cameraxVersion}"
+    implementation "androidx.camera:camera-camera2:${cameraxVersion}"
+    implementation "androidx.camera:camera-lifecycle:${cameraxVersion}"
+    implementation "androidx.camera:camera-view:${cameraxVersion}"
+
+    // Hardware-accelerated H.264 + AAC RTMP/RTMPS streaming engine (RootEncoder)
+    implementation "com.github.pedroSG94.RootEncoder:library:2.5.6"
+}
+
+apply from: 'capacitor.build.gradle'
