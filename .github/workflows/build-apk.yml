@@ -46,14 +46,17 @@ jobs:
         run: |
           npx cap sync android
 
-      - name: Configure gradle.properties & Android SDK settings
+      - name: Configure gradle.properties, RootEncoder & Android SDK settings
         working-directory: android
         run: |
-          # Create or update gradle.properties with AndroidX & Jetifier enabled
+          # Enable AndroidX & Jetifier
           touch gradle.properties
           grep -q "android.useAndroidX" gradle.properties || echo "android.useAndroidX=true" >> gradle.properties
           grep -q "android.enableJetifier" gradle.properties || echo "android.enableJetifier=true" >> gradle.properties
           grep -q "org.gradle.jvmargs" gradle.properties || echo "org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8" >> gradle.properties
+
+          # Fix non-existent RootEncoder 2.5.6 version to valid 2.5.5 release
+          find . -name "*.gradle*" -type f -exec sed -i 's/RootEncoder:library:2.5.6/RootEncoder:library:2.5.5/g' {} +
 
           # Ensure compileSdk 35 & targetSdk 35 in variables.gradle if present
           if [ -f "variables.gradle" ]; then
