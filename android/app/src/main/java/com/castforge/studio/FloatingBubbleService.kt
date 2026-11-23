@@ -7,6 +7,8 @@ import android.graphics.PixelFormat
 import android.graphics.drawable.GradientDrawable
 import android.os.Build
 import android.os.IBinder
+import android.provider.Settings
+import android.util.Log
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
@@ -16,9 +18,7 @@ import android.widget.TextView
 import kotlin.math.abs
 
 /**
- * Floating draggable control bubble overlay (SYSTEM_ALERT_WINDOW).
- * Lets gamers mute microphone, toggle in-game chat overlay, or stop the broadcast
- * from inside any fullscreen Android game without leaving the match.
+ * Crash-hardened Floating draggable control bubble overlay (SYSTEM_ALERT_WINDOW).
  */
 class FloatingBubbleService : Service() {
 
@@ -34,19 +34,31 @@ class FloatingBubbleService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        when (intent?.action) {
-            ACTION_SHOW -> showBubble()
-            ACTION_HIDE -> {
-                removeBubble()
-                stopSelf()
+        try {
+            when (intent?.action) {
+                ACTION_SHOW -> showBubble()
+                ACTION_HIDE -> {
+                    removeBubble()
+                    stopSelf()
+                }
             }
+        } catch (t: Throwable) {
+            Log.e(TAG, "FloatingBubbleService error", t)
+            removeBubble()
+            stopSelf()
         }
         return START_NOT_STICKY
     }
 
     private fun showBubble() {
         if (rootContainer != null) return
-        windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !Settings.canDrawOverlays(this)) {
+            Log.w(TAG, "Cannot show floating bubble without SYSTEM_ALERT_WINDOW permission")
+            stopSelf()
+            return
+        }
+
+        windowManager = getSystemService(WINDOW_SERVICE) as? WindowManager ?: return
 
         val overlayType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
@@ -72,7 +84,6 @@ class FloatingBubbleService : Service() {
             gravity = Gravity.CENTER_VERTICAL
         }
 
-        // Primary circular draggable broadcast bubble
         val bubble = TextView(this).apply {
             text = "LIVE"
             textSize = 11f
@@ -88,7 +99,6 @@ class FloatingBubbleService : Service() {
             elevation = dp(6).toFloat()
         }
 
-        // Expandable quick control tray
         val tray = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             visibility = View.GONE
@@ -111,10 +121,12 @@ class FloatingBubbleService : Service() {
             micMuted = !micMuted
             btn.text = if (micMuted) "Muted" else "Mic On"
             btn.setTextColor(if (micMuted) Color.parseColor("#F87171") else Color.WHITE)
-            startService(
-                Intent(this, StreamingForegroundService::class.java)
-                    .setAction(StreamingForegroundService.ACTION_TOGGLE_MIC)
-            )
+            runCatching {
+                startService(
+                    Intent(this, StreamingForegroundService::class.java)
+                        .setAction(StreamingForegroundService.ACTION_TOGGLE_MIC)
+                )
+            }
             emitBubbleCommand("toggleMic", micMuted)
         }
 
@@ -125,10 +137,12 @@ class FloatingBubbleService : Service() {
         }
 
         val stopBtn = createTrayButton("Stop") {
-            startService(
-                Intent(this, StreamingForegroundService::class.java)
-                    .setAction(StreamingForegroundService.ACTION_STOP)
-            )
+            runCatching {
+                startService(
+                    Intent(this, StreamingForegroundService::class.java)
+                        .setAction(StreamingForegroundService.ACTION_STOP)
+                )
+            }
             emitBubbleCommand("stopStream", true)
             removeBubble()
             stopSelf()
@@ -145,9 +159,14 @@ class FloatingBubbleService : Service() {
         container.addView(bubble)
         container.addView(tray)
 
-        rootContainer = container
-        actionTray = tray
-        windowManager?.addView(container, layoutParams)
+        try {
+            windowManager?.addView(container, layoutParams)
+            rootContainer = container
+            actionTray = tray
+        } catch (t: Throwable) {
+            Log.e(TAG, "WindowManager.addView failed safely", t)
+            stopSelf()
+        }
     }
 
     private fun createTrayButton(label: String, onClick: (TextView) -> Unit): TextView {
@@ -156,7 +175,7 @@ class FloatingBubbleService : Service() {
             textSize = 12f
             setTextColor(Color.WHITE)
             setPadding(dp(12), dp(8), dp(12), dp(8))
-            setOnClickListener { onClick(this) }
+            setOnClickListener { runCatching { onClick(this) } }
         }
     }
 
@@ -169,43 +188,49 @@ class FloatingBubbleService : Service() {
 
         bubble.setOnTouchListener { _, event ->
             val lp = layoutParams ?: return@setOnTouchListener false
-            when (event.action) {
-                MotionEvent.ACTION_DOWN -> {
-                    initialX = lp.x
-                    initialY = lp.y
-                    initialTouchX = event.rawX
-                    initialTouchY = event.rawY
-                    moved = false
-                    true
-                }
-                MotionEvent.ACTION_MOVE -> {
-                    val dx = (event.rawX - initialTouchX).toInt()
-                    val dy = (event.rawY - initialTouchY).toInt()
-                    if (abs(dx) > 8 || abs(dy) > 8) moved = true
-                    lp.x = initialX + dx
-                    lp.y = initialY + dy
-                    windowManager?.updateViewLayout(rootContainer, lp)
-                    true
-                }
-                MotionEvent.ACTION_UP -> {
-                    if (!moved) {
-                        isExpanded = !isExpanded
-                        tray.visibility = if (isExpanded) View.VISIBLE else View.GONE
+            try {
+                when (event.action) {
+                    MotionEvent.ACTION_DOWN -> {
+                        initialX = lp.x
+                        initialY = lp.y
+                        initialTouchX = event.rawX
+                        initialTouchY = event.rawY
+                        moved = false
+                        true
                     }
-                    true
+                    MotionEvent.ACTION_MOVE -> {
+                        val dx = (event.rawX - initialTouchX).toInt()
+                        val dy = (event.rawY - initialTouchY).toInt()
+                        if (abs(dx) > 8 || abs(dy) > 8) moved = true
+                        lp.x = initialX + dx
+                        lp.y = initialY + dy
+                        rootContainer?.let { windowManager?.updateViewLayout(it, lp) }
+                        true
+                    }
+                    MotionEvent.ACTION_UP -> {
+                        if (!moved) {
+                            isExpanded = !isExpanded
+                            tray.visibility = if (isExpanded) View.VISIBLE else View.GONE
+                        }
+                        true
+                    }
+                    else -> false
                 }
-                else -> false
+            } catch (_: Throwable) {
+                false
             }
         }
     }
 
     private fun emitBubbleCommand(command: String, value: Boolean) {
-        val intent = Intent(ACTION_BUBBLE_COMMAND).apply {
-            setPackage(packageName)
-            putExtra("command", command)
-            putExtra("value", value)
+        runCatching {
+            val intent = Intent(ACTION_BUBBLE_COMMAND).apply {
+                setPackage(packageName)
+                putExtra("command", command)
+                putExtra("value", value)
+            }
+            sendBroadcast(intent)
         }
-        sendBroadcast(intent)
     }
 
     private fun removeBubble() {
@@ -224,6 +249,7 @@ class FloatingBubbleService : Service() {
     }
 
     companion object {
+        private const val TAG = "CastForgeBubbleSvc"
         const val ACTION_SHOW = "com.castforge.studio.BUBBLE_SHOW"
         const val ACTION_HIDE = "com.castforge.studio.BUBBLE_HIDE"
         const val ACTION_BUBBLE_COMMAND = "com.castforge.studio.BUBBLE_COMMAND"

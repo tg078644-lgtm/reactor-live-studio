@@ -3,6 +3,12 @@ import java.util.Base64
 apply plugin: 'com.android.application'
 apply plugin: 'org.jetbrains.kotlin.android'
 
+repositories {
+    google()
+    mavenCentral()
+    maven { url 'https://jitpack.io' }
+}
+
 def keystoreDir = file("${rootProject.projectDir}/keystore")
 def autoKeystoreFile = file("${keystoreDir}/castforge-auto.keystore")
 def resolvedKeystorePath = System.getenv("KEYSTORE_FILE") ?: autoKeystoreFile.absolutePath
@@ -81,12 +87,12 @@ tasks.matching {
 
 android {
     namespace "com.castforge.studio"
-    compileSdk rootProject.ext.compileSdkVersion
+    compileSdk = 36
 
     defaultConfig {
         applicationId "com.castforge.studio"
         minSdkVersion rootProject.ext.minSdkVersion
-        targetSdkVersion rootProject.ext.targetSdkVersion
+        targetSdkVersion 35
         versionCode 100
         versionName "1.0.0"
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
@@ -129,8 +135,8 @@ android {
 dependencies {
     implementation fileTree(include: ['*.jar'], dir: 'libs')
     implementation "androidx.appcompat:appcompat:$androidxAppCompatVersion"
-    implementation "androidx.core:core-ktx:1.15.0"
-    implementation "androidx.activity:activity-ktx:1.9.3"
+    implementation "androidx.core:core-ktx:$androidxCoreVersion"
+    implementation "androidx.activity:activity-ktx:$androidxActivityVersion"
     implementation project(':capacitor-android')
 
     // EncryptedSharedPreferences for RTMP URLs & Stream Keys
@@ -144,7 +150,7 @@ dependencies {
     implementation "androidx.camera:camera-view:${cameraxVersion}"
 
     // Hardware-accelerated H.264 + AAC RTMP/RTMPS streaming engine (RootEncoder)
-    implementation "com.github.pedroSG94.RootEncoder:library:2.5.6"
+    implementation "com.github.pedroSG94.RootEncoder:library:2.5.5"
 }
 
 apply from: 'capacitor.build.gradle'

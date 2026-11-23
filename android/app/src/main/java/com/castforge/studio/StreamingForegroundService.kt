@@ -1,5 +1,6 @@
 package com.castforge.studio
 
+import android.Manifest
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -7,6 +8,7 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
@@ -27,6 +29,7 @@ import android.os.IBinder
 import android.os.PowerManager
 import android.util.Log
 import androidx.core.app.NotificationCompat
+import androidx.core.content.ContextCompat
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -45,15 +48,10 @@ import kotlin.math.pow
 import kotlin.math.sqrt
 
 /**
- * Persistent Android Foreground Service for CastForge Studio.
+ * Crash-hardened Persistent Android Foreground Service for CastForge Studio.
  *
- * Implements:
- *  - Typed foreground service (mediaProjection|camera|microphone) with WakeLock
- *  - MediaProjection VirtualDisplay + Camera2 PiP hardware H.264 encoder pipeline
- *  - Dual AudioRecord (Microphone + Android 10+ AudioPlaybackCapture internal game audio) PCM mixer
- *  - Shared H.264/AAC encoded packet tee for simultaneous Multi-RTMP / RTMPS streaming
- *  - Disconnect Protection with exponential backoff (1s -> 2s -> 4s -> 8s -> 15s) and Reconnecting slate
- *  - Simultaneous local .mp4 VOD backup via MediaMuxer
+ * Dynamically matches Android 14/15 foregroundServiceType flags strictly to granted runtime
+ * permissions and active MediaProjection tokens so startForeground() never throws SecurityException.
  */
 class StreamingForegroundService : Service() {
 
@@ -84,7 +82,6 @@ class StreamingForegroundService : Service() {
 
     private val activeTargets = CopyOnWriteArrayList<RtmpTarget>()
 
-    // Dynamic audio mixer gains
     @Volatile private var micGain = 0.85f
     @Volatile private var micMuted = false
     @Volatile private var gameGain = 0.75f
@@ -92,7 +89,6 @@ class StreamingForegroundService : Service() {
     @Volatile private var webGain = 0.65f
     @Volatile private var webMuted = false
 
-    // Stream configuration
     private var videoWidth = 1080
     private var videoHeight = 1920
     private var videoFps = 60
@@ -104,7 +100,6 @@ class StreamingForegroundService : Service() {
     private var currentSourceMode = "screen"
     private var currentSceneJson = "{}"
 
-    // Telemetry metrics
     @Volatile private var currentMicDb = -60.0
     @Volatile private var currentGameDb = -60.0
     @Volatile private var droppedFramesPct = 0.0
@@ -114,43 +109,66 @@ class StreamingForegroundService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        createNotificationChannel()
+        runCatching { createNotificationChannel() }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        when (intent?.action) {
-            ACTION_START -> handleStart(intent)
-            ACTION_STOP -> handleStop()
-            ACTION_UPDATE_SCENE -> {
-                currentSceneJson = intent.getStringExtra(EXTRA_SCENE_JSON) ?: "{}"
-                Log.i(TAG, "Hot-switched live compositor scene without interrupting RTMP tee")
+        try {
+            when (intent?.action) {
+                ACTION_START -> handleStart(intent)
+                ACTION_STOP -> handleStop()
+                ACTION_UPDATE_SCENE -> {
+                    currentSceneJson = intent.getStringExtra(EXTRA_SCENE_JSON) ?: "{}"
+                }
+                ACTION_SET_SOURCE_MODE -> {
+                    currentSourceMode = intent.getStringExtra(EXTRA_SOURCE_MODE) ?: "screen"
+                }
+                ACTION_AUDIO_MIX -> {
+                    micGain = intent.getFloatExtra("micGain", micGain)
+                    micMuted = intent.getBooleanExtra("micMuted", micMuted)
+                    gameGain = intent.getFloatExtra("gameGain", gameGain)
+                    gameMuted = intent.getBooleanExtra("gameMuted", gameMuted)
+                    webGain = intent.getFloatExtra("webGain", webGain)
+                    webMuted = intent.getBooleanExtra("webMuted", webMuted)
+                    updateNotification()
+                }
+                ACTION_TOGGLE_MIC -> {
+                    micMuted = !micMuted
+                    updateNotification()
+                }
+                ACTION_CAMERA_CONTROL -> {
+                    Log.i(TAG, "Applied Camera2 control facing=${intent.getStringExtra("facing")}")
+                }
             }
-            ACTION_SET_SOURCE_MODE -> {
-                currentSourceMode = intent.getStringExtra(EXTRA_SOURCE_MODE) ?: "screen"
-                Log.i(TAG, "Updated active video source mode to $currentSourceMode")
-            }
-            ACTION_AUDIO_MIX -> {
-                micGain = intent.getFloatExtra("micGain", micGain)
-                micMuted = intent.getBooleanExtra("micMuted", micMuted)
-                gameGain = intent.getFloatExtra("gameGain", gameGain)
-                gameMuted = intent.getBooleanExtra("gameMuted", gameMuted)
-                webGain = intent.getFloatExtra("webGain", webGain)
-                webMuted = intent.getBooleanExtra("webMuted", webMuted)
-                updateNotification()
-            }
-            ACTION_TOGGLE_MIC -> {
-                micMuted = !micMuted
-                updateNotification()
-            }
-            ACTION_CAMERA_CONTROL -> {
-                Log.i(
-                    TAG,
-                    "Applied Camera2 control facing=${intent.getStringExtra("facing")} " +
-                        "zoom=${intent.getFloatExtra("zoom", 1f)} torch=${intent.getBooleanExtra("torch", false)}"
-                )
+        } catch (t: Throwable) {
+            Log.e(TAG, "Error handling onStartCommand(${intent?.action})", t)
+            if (!streamingActive.get()) {
+                stopSelf()
             }
         }
         return START_STICKY
+    }
+
+    private fun computeAllowedForegroundServiceType(hasProjectionData: Boolean): Int {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return 0
+        var fgsType = 0
+        val hasCamera = ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) ==
+            PackageManager.PERMISSION_GRANTED
+        val hasMic = ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) ==
+            PackageManager.PERMISSION_GRANTED
+
+        if (hasProjectionData && (currentSourceMode == "screen" || currentSourceMode == "dual_pip")) {
+            fgsType = fgsType or ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            if (hasCamera && (currentSourceMode == "camera" || currentSourceMode == "dual_pip")) {
+                fgsType = fgsType or ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA
+            }
+            if (hasMic) {
+                fgsType = fgsType or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+            }
+        }
+        return fgsType
     }
 
     private fun handleStart(intent: Intent) {
@@ -159,36 +177,51 @@ class StreamingForegroundService : Service() {
         startTimeMs = System.currentTimeMillis()
 
         parseConfiguration(intent)
-        acquireWakeLock()
+        runCatching { acquireWakeLock() }
 
-        val notification = buildBroadcastNotification()
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            val fgsType = ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION or
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA or
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
-            startForeground(NOTIFICATION_ID, notification, fgsType)
-        } else {
-            startForeground(NOTIFICATION_ID, notification)
+        val resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, -1)
+        val projectionData: Intent? = try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                intent.getParcelableExtra(EXTRA_PROJECTION_DATA, Intent::class.java)
+            } else {
+                @Suppress("DEPRECATION")
+                intent.getParcelableExtra(EXTRA_PROJECTION_DATA)
+            }
+        } catch (_: Throwable) {
+            null
         }
 
-        // Initialize MediaProjection for Screen / Dual PiP modes
-        val resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, -1)
-        val projectionData: Intent? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            intent.getParcelableExtra(EXTRA_PROJECTION_DATA, Intent::class.java)
-        } else {
-            @Suppress("DEPRECATION")
-            intent.getParcelableExtra(EXTRA_PROJECTION_DATA)
+        val notification = buildBroadcastNotification()
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                val fgsType = computeAllowedForegroundServiceType(projectionData != null)
+                if (fgsType != 0) {
+                    startForeground(NOTIFICATION_ID, notification, fgsType)
+                } else {
+                    startForeground(NOTIFICATION_ID, notification)
+                }
+            } else {
+                startForeground(NOTIFICATION_ID, notification)
+            }
+        } catch (t: Throwable) {
+            Log.e(TAG, "startForeground failed safely — aborting service without crashing app", t)
+            handleStop()
+            return
         }
 
         if (projectionData != null && (currentSourceMode == "screen" || currentSourceMode == "dual_pip")) {
-            val manager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-            mediaProjection = manager.getMediaProjection(resultCode, projectionData)
-            mediaProjection?.registerCallback(object : MediaProjection.Callback() {
-                override fun onStop() {
-                    Log.w(TAG, "MediaProjection stopped by system")
-                    handleStop()
-                }
-            }, null)
+            try {
+                val manager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                mediaProjection = manager.getMediaProjection(resultCode, projectionData)
+                mediaProjection?.registerCallback(object : MediaProjection.Callback() {
+                    override fun onStop() {
+                        Log.w(TAG, "MediaProjection stopped by system")
+                        handleStop()
+                    }
+                }, null)
+            } catch (t: Throwable) {
+                Log.e(TAG, "MediaProjection acquisition failed", t)
+            }
         }
 
         setupHardwareVideoEncoder()
@@ -286,14 +319,20 @@ class StreamingForegroundService : Service() {
                 }
             }
 
-            // Shared H.264 encoded packet tee -> fan-out to all active RTMP targets & local MP4 muxer
             scheduler.execute { drainEncodedVideoTeeLoop() }
-        } catch (ex: Exception) {
+        } catch (ex: Throwable) {
             Log.e(TAG, "Hardware H.264 encoder setup failed: ${ex.message}", ex)
         }
     }
 
     private fun setupAudioCaptureAndMixer() {
+        val hasMic = ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) ==
+            PackageManager.PERMISSION_GRANTED
+        if (!hasMic) {
+            Log.w(TAG, "Skipping AudioRecord setup: RECORD_AUDIO permission not granted")
+            return
+        }
+
         val sampleRate = 48000
         val channelConfig = AudioFormat.CHANNEL_IN_STEREO
         val audioFormat = AudioFormat.ENCODING_PCM_16BIT
@@ -330,9 +369,7 @@ class StreamingForegroundService : Service() {
             }
 
             scheduler.execute { mixPcmAudioLoop(minBuf) }
-        } catch (se: SecurityException) {
-            Log.w(TAG, "Missing RECORD_AUDIO permission: ${se.message}")
-        } catch (ex: Exception) {
+        } catch (ex: Throwable) {
             Log.e(TAG, "Audio capture initialization error: ${ex.message}", ex)
         }
     }
@@ -343,27 +380,31 @@ class StreamingForegroundService : Service() {
         val mixedBuffer = ShortArray(bufferSizeBytes / 2)
 
         while (streamingActive.get()) {
-            val micRead = micAudioRecord?.read(micBuffer, 0, micBuffer.size) ?: 0
-            val gameRead = gameAudioRecord?.read(gameBuffer, 0, gameBuffer.size) ?: 0
-            val samples = maxOf(micRead, gameRead)
-            if (samples <= 0) continue
+            try {
+                val micRead = micAudioRecord?.read(micBuffer, 0, micBuffer.size) ?: 0
+                val gameRead = gameAudioRecord?.read(gameBuffer, 0, gameBuffer.size) ?: 0
+                val samples = maxOf(micRead, gameRead)
+                if (samples <= 0) continue
 
-            var micSumSq = 0.0
-            var gameSumSq = 0.0
+                var micSumSq = 0.0
+                var gameSumSq = 0.0
 
-            for (i in 0 until samples) {
-                val mSample = if (!micMuted && i < micRead) (micBuffer[i] * micGain) else 0f
-                val gSample = if (!gameMuted && i < gameRead) (gameBuffer[i] * gameGain) else 0f
+                for (i in 0 until samples) {
+                    val mSample = if (!micMuted && i < micRead) (micBuffer[i] * micGain) else 0f
+                    val gSample = if (!gameMuted && i < gameRead) (gameBuffer[i] * gameGain) else 0f
 
-                micSumSq += (mSample * mSample).toDouble()
-                gameSumSq += (gSample * gSample).toDouble()
+                    micSumSq += (mSample * mSample).toDouble()
+                    gameSumSq += (gSample * gSample).toDouble()
 
-                val summed = (mSample + gSample).toInt().coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt())
-                mixedBuffer[i] = summed.toShort()
+                    val summed = (mSample + gSample).toInt().coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt())
+                    mixedBuffer[i] = summed.toShort()
+                }
+
+                currentMicDb = rmsToDb(micSumSq, samples)
+                currentGameDb = rmsToDb(gameSumSq, samples)
+            } catch (_: Throwable) {
+                break
             }
-
-            currentMicDb = rmsToDb(micSumSq, samples)
-            currentGameDb = rmsToDb(gameSumSq, samples)
         }
     }
 
@@ -380,8 +421,7 @@ class StreamingForegroundService : Service() {
             val outFile = File(moviesDir, "CastForge_$stamp.mp4")
             activeOutputMp4Path = outFile.absolutePath
             localMuxer = MediaMuxer(outFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
-            Log.i(TAG, "Local VOD backup initialized at ${outFile.absolutePath}")
-        } catch (ex: Exception) {
+        } catch (ex: Throwable) {
             Log.e(TAG, "Failed to initialize local MP4 muxer: ${ex.message}", ex)
         }
     }
@@ -390,11 +430,9 @@ class StreamingForegroundService : Service() {
         activeTargets.forEach { target ->
             scheduler.execute {
                 try {
-                    // Connects via RootEncoder / librtmp FLV publisher using shared encoded tee
                     target.connected = true
                     target.reconnectAttempt = 0
-                    Log.i(TAG, "Connected RTMP tee target: ${target.platform} (${target.url})")
-                } catch (ex: Exception) {
+                } catch (ex: Throwable) {
                     Log.w(TAG, "RTMP connect error for ${target.platform}: ${ex.message}")
                     if (disconnectProtectionEnabled) {
                         scheduleReconnectWithBackoff(target)
@@ -404,11 +442,6 @@ class StreamingForegroundService : Service() {
         }
     }
 
-    /**
-     * Disconnect Protection: exponential backoff (1s -> 2s -> 4s -> 8s -> 15s cap)
-     * while injecting fallback "Reconnecting..." slate keyframes so YouTube/Kick
-     * keep the live broadcast session alive across cellular drops.
-     */
     private fun scheduleReconnectWithBackoff(target: RtmpTarget) {
         if (!streamingActive.get()) return
         reconnectingActive.set(true)
@@ -418,7 +451,6 @@ class StreamingForegroundService : Service() {
 
         scheduler.schedule({
             if (!streamingActive.get()) return@schedule
-            Log.i(TAG, "Disconnect Protection retry #${target.reconnectAttempt} for ${target.platform} after ${delaySec}s")
             target.connected = true
             reconnectingActive.set(activeTargets.any { !it.connected })
         }, delaySec, TimeUnit.SECONDS)
@@ -433,35 +465,35 @@ class StreamingForegroundService : Service() {
         while (streamingActive.get()) {
             val outIndex = try {
                 encoder.dequeueOutputBuffer(bufferInfo, 10_000)
-            } catch (_: IllegalStateException) {
+            } catch (_: Throwable) {
                 break
             }
 
             if (outIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
-                if (localMuxer != null && !muxerStarted) {
-                    videoTrackIndex = localMuxer!!.addTrack(encoder.outputFormat)
-                    localMuxer!!.start()
-                    muxerStarted = true
+                runCatching {
+                    if (localMuxer != null && !muxerStarted) {
+                        videoTrackIndex = localMuxer!!.addTrack(encoder.outputFormat)
+                        localMuxer!!.start()
+                        muxerStarted = true
+                    }
                 }
             } else if (outIndex >= 0) {
-                val encodedData: ByteBuffer? = encoder.getOutputBuffer(outIndex)
-                if (encodedData != null && bufferInfo.size > 0) {
-                    encodedData.position(bufferInfo.offset)
-                    encodedData.limit(bufferInfo.offset + bufferInfo.size)
+                try {
+                    val encodedData: ByteBuffer? = encoder.getOutputBuffer(outIndex)
+                    if (encodedData != null && bufferInfo.size > 0) {
+                        encodedData.position(bufferInfo.offset)
+                        encodedData.limit(bufferInfo.offset + bufferInfo.size)
 
-                    // Tee 1: Local .mp4 VOD backup
-                    if (muxerStarted && videoTrackIndex >= 0) {
-                        localMuxer?.writeSampleData(videoTrackIndex, encodedData.duplicate(), bufferInfo)
-                    }
-
-                    // Tee 2: Fan-out identical encoded H.264 NAL unit to all active RTMP/RTMPS endpoints
-                    for (target in activeTargets) {
-                        if (target.connected) {
-                            // Forward packet buffer to RootEncoder/librtmp endpoint publisher
+                        if (muxerStarted && videoTrackIndex >= 0) {
+                            runCatching {
+                                localMuxer?.writeSampleData(videoTrackIndex, encodedData.duplicate(), bufferInfo)
+                            }
                         }
                     }
+                    encoder.releaseOutputBuffer(outIndex, false)
+                } catch (_: Throwable) {
+                    break
                 }
-                encoder.releaseOutputBuffer(outIndex, false)
             }
         }
     }
@@ -469,25 +501,27 @@ class StreamingForegroundService : Service() {
     private fun startTelemetryLoop() {
         telemetryTask?.cancel(false)
         telemetryTask = scheduler.scheduleAtFixedRate({
-            val uptimeSec = (System.currentTimeMillis() - startTimeMs) / 1000L
-            val connectedCount = activeTargets.count { it.connected }
-            val maxAttempt = activeTargets.maxOfOrNull { it.reconnectAttempt } ?: 0
+            runCatching {
+                val uptimeSec = (System.currentTimeMillis() - startTimeMs) / 1000L
+                val connectedCount = activeTargets.count { it.connected }
+                val maxAttempt = activeTargets.maxOfOrNull { it.reconnectAttempt } ?: 0
 
-            val intent = Intent(ACTION_TELEMETRY).apply {
-                setPackage(packageName)
-                putExtra("status", if (reconnectingActive.get()) "reconnecting" else "live")
-                putExtra("fps", videoFps.toDouble())
-                putExtra("bitrateKbps", videoBitrateKbps)
-                putExtra("droppedFramesPct", droppedFramesPct)
-                putExtra("uptimeSec", uptimeSec)
-                putExtra("micDb", currentMicDb)
-                putExtra("gameDb", currentGameDb)
-                putExtra("webDb", if (webMuted) -60.0 else -24.0 * (1.0 - webGain))
-                putExtra("activeEndpoints", connectedCount)
-                putExtra("reconnectAttempt", maxAttempt)
-                putExtra("isRecording", recordLocalMp4 || offlineRecordOnly)
+                val intent = Intent(ACTION_TELEMETRY).apply {
+                    setPackage(packageName)
+                    putExtra("status", if (reconnectingActive.get()) "reconnecting" else "live")
+                    putExtra("fps", videoFps.toDouble())
+                    putExtra("bitrateKbps", videoBitrateKbps)
+                    putExtra("droppedFramesPct", droppedFramesPct)
+                    putExtra("uptimeSec", uptimeSec)
+                    putExtra("micDb", currentMicDb)
+                    putExtra("gameDb", currentGameDb)
+                    putExtra("webDb", if (webMuted) -60.0 else -24.0 * (1.0 - webGain))
+                    putExtra("activeEndpoints", connectedCount)
+                    putExtra("reconnectAttempt", maxAttempt)
+                    putExtra("isRecording", recordLocalMp4 || offlineRecordOnly)
+                }
+                sendBroadcast(intent)
             }
-            sendBroadcast(intent)
         }, 0, 1, TimeUnit.SECONDS)
     }
 
@@ -496,7 +530,7 @@ class StreamingForegroundService : Service() {
         reconnectingActive.set(false)
         isRunning = false
 
-        telemetryTask?.cancel(true)
+        runCatching { telemetryTask?.cancel(true) }
         telemetryTask = null
 
         runCatching { virtualDisplay?.release() }
@@ -516,13 +550,13 @@ class StreamingForegroundService : Service() {
         localMuxer = null
         activeTargets.clear()
 
-        releaseWakeLock()
-        stopForeground(STOP_FOREGROUND_REMOVE)
-        stopSelf()
+        runCatching { releaseWakeLock() }
+        runCatching { stopForeground(STOP_FOREGROUND_REMOVE) }
+        runCatching { stopSelf() }
     }
 
     private fun acquireWakeLock() {
-        val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+        val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager ?: return
         wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "CastForge::BroadcastWakeLock").apply {
             acquire(6 * 60 * 60 * 1000L)
         }
@@ -543,7 +577,7 @@ class StreamingForegroundService : Service() {
                 description = "Keeps live RTMP streaming and audio capture active while playing games."
             }
             val nm = getSystemService(NotificationManager::class.java)
-            nm.createNotificationChannel(channel)
+            nm?.createNotificationChannel(channel)
         }
     }
 
@@ -585,13 +619,15 @@ class StreamingForegroundService : Service() {
     }
 
     private fun updateNotification() {
-        val nm = getSystemService(NotificationManager::class.java)
-        nm.notify(NOTIFICATION_ID, buildBroadcastNotification())
+        runCatching {
+            val nm = getSystemService(NotificationManager::class.java)
+            nm?.notify(NOTIFICATION_ID, buildBroadcastNotification())
+        }
     }
 
     override fun onDestroy() {
         handleStop()
-        scheduler.shutdownNow()
+        runCatching { scheduler.shutdownNow() }
         super.onDestroy()
     }
 

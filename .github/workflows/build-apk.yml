@@ -37,6 +37,17 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
+      - name: Configure Ubuntu pre-installed Android SDK (API 36)
+        run: |
+          SDK_DIR="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          echo "ANDROID_HOME=$SDK_DIR" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK_DIR" >> "$GITHUB_ENV"
+          SDKMANAGER=$(find "$SDK_DIR/cmdline-tools" -name "sdkmanager" 2>/dev/null | head -n 1)
+          if [ -n "$SDKMANAGER" ]; then
+            yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
+            "$SDKMANAGER" "platforms;android-36" "build-tools;35.0.0" || true
+          fi
+
       - name: Install dependencies & build web studio bundle
         run: |
           npm install --legacy-peer-deps
@@ -46,34 +57,18 @@ jobs:
         run: |
           npx cap sync android
 
-      - name: Configure gradle.properties, RootEncoder & Android SDK 36
-        working-directory: android
-        run: |
-          # Enable AndroidX & Jetifier
-          touch gradle.properties
-          grep -q "android.useAndroidX" gradle.properties || echo "android.useAndroidX=true" >> gradle.properties
-          grep -q "android.enableJetifier" gradle.properties || echo "android.enableJetifier=true" >> gradle.properties
-          grep -q "org.gradle.jvmargs" gradle.properties || echo "org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8" >> gradle.properties
-
-          # Fix non-existent RootEncoder 2.5.6 version to valid 2.5.5 release
-          find . -name "*.gradle*" -type f -exec sed -i 's/RootEncoder:library:2.5.6/RootEncoder:library:2.5.5/g' {} +
-
-          # Upgrade compileSdk to 36 across variables.gradle and build.gradle files
-          find . -name "*.gradle*" -type f -exec sed -i 's/compileSdkVersion = [0-9]*/compileSdkVersion = 36/g' {} +
-          find . -name "*.gradle*" -type f -exec sed -i 's/compileSdk = [0-9]*/compileSdk = 36/g' {} +
-          find . -name "*.gradle*" -type f -exec sed -i 's/compileSdk [0-9]*/compileSdk 36/g' {} +
-
       - name: Ensure Gradle wrapper is executable
         working-directory: android
         run: |
           if [ ! -f "./gradlew" ]; then
-            gradle wrapper --gradle-version 8.10.2
+            gradle wrapper --gradle-version 8.11.1
           fi
           chmod +x ./gradlew
 
       - name: Provision signing keystore & assemble signed APKs
         working-directory: android
         env:
+          # Optional repository secrets: if omitted, ensureSigningKeystore auto-generates a valid keystore
           KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
           KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
@@ -82,19 +77,21 @@ jobs:
           BUILD_TYPE="${{ github.event.inputs.build_type || 'both' }}"
           ./gradlew ensureSigningKeystore
           if [ "$BUILD_TYPE" = "debug" ]; then
-            ./gradlew assembleDebug --stacktrace
+            ./gradlew assembleDebug
           elif [ "$BUILD_TYPE" = "release" ]; then
-            ./gradlew assembleRelease --stacktrace
+            ./gradlew assembleRelease
           else
-            ./gradlew assembleDebug assembleRelease --stacktrace
+            ./gradlew assembleDebug assembleRelease
           fi
 
       - name: Verify APK signatures
         run: |
           APKSIGNER=$(find "$ANDROID_HOME/build-tools" -name "apksigner" | sort -V | tail -n 1)
           for apk in android/app/build/outputs/apk/*/*.apk; do
-            echo "Verifying signed APK: $apk"
-            "$APKSIGNER" verify --verbose "$apk"
+            if [ -f "$apk" ]; then
+              echo "Verifying signed APK: $apk"
+              "$APKSIGNER" verify --verbose "$apk"
+            fi
           done
 
       - name: Upload Signed Debug APK

@@ -67,7 +67,7 @@ export const AndroidPackagePanel: React.FC<AndroidPackagePanelProps> = ({
                 Android Native Streaming Engine & APK Pipeline
               </h2>
               <p className="text-xs text-zinc-400 mt-0.5">
-                Package ID com.castforge.studio · Target SDK 35 · Capacitor 8 + Kotlin
+                Package ID com.castforge.studio · Compile SDK 36 · Target SDK 35 · Capacitor 8 + Kotlin
               </p>
             </div>
             <span className="text-xs font-mono-tabular text-zinc-300">

@@ -422,7 +422,7 @@ export default function App() {
 
     setStreamStatus('connecting');
     try {
-      await streamEngineBridge.startStream({
+      const startResult = await streamEngineBridge.startStream({
         destinations: armedDestinations,
         quality,
         activeScene,
@@ -432,6 +432,12 @@ export default function App() {
         disconnectProtection: quality.disconnectProtection,
         showFloatingBubble,
       });
+
+      if (!startResult?.started) {
+        setStreamStatus('idle');
+        showTempNotice('Permissions or screen capture prompt were not granted. Tap Go Live to retry.');
+        return;
+      }
 
       window.setTimeout(() => {
         streamStartEpochRef.current = Date.now();
