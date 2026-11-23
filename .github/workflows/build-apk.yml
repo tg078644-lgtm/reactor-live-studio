@@ -46,7 +46,7 @@ jobs:
         run: |
           npx cap sync android
 
-      - name: Configure gradle.properties, RootEncoder & Android SDK settings
+      - name: Configure gradle.properties, RootEncoder & Android SDK 36
         working-directory: android
         run: |
           # Enable AndroidX & Jetifier
@@ -58,11 +58,10 @@ jobs:
           # Fix non-existent RootEncoder 2.5.6 version to valid 2.5.5 release
           find . -name "*.gradle*" -type f -exec sed -i 's/RootEncoder:library:2.5.6/RootEncoder:library:2.5.5/g' {} +
 
-          # Ensure compileSdk 35 & targetSdk 35 in variables.gradle if present
-          if [ -f "variables.gradle" ]; then
-            sed -i 's/compileSdkVersion = .*/compileSdkVersion = 35/' variables.gradle
-            sed -i 's/targetSdkVersion = .*/targetSdkVersion = 35/' variables.gradle
-          fi
+          # Upgrade compileSdk to 36 across variables.gradle and build.gradle files
+          find . -name "*.gradle*" -type f -exec sed -i 's/compileSdkVersion = [0-9]*/compileSdkVersion = 36/g' {} +
+          find . -name "*.gradle*" -type f -exec sed -i 's/compileSdk = [0-9]*/compileSdk = 36/g' {} +
+          find . -name "*.gradle*" -type f -exec sed -i 's/compileSdk [0-9]*/compileSdk 36/g' {} +
 
       - name: Ensure Gradle wrapper is executable
         working-directory: android
